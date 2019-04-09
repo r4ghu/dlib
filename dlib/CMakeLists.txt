@@ -5,11 +5,16 @@
 
 
 cmake_minimum_required(VERSION 2.8.12)
+
+if(POLICY CMP0048)
+   cmake_policy(SET CMP0048 NEW)
+endif()
+
 project(dlib)
 
 set(CPACK_PACKAGE_NAME "dlib")
 set(CPACK_PACKAGE_VERSION_MAJOR "19")
-set(CPACK_PACKAGE_VERSION_MINOR "16")
+set(CPACK_PACKAGE_VERSION_MINOR "17")
 set(CPACK_PACKAGE_VERSION_PATCH "99")
 set(VERSION ${CPACK_PACKAGE_VERSION_MAJOR}.${CPACK_PACKAGE_VERSION_MINOR}.${CPACK_PACKAGE_VERSION_PATCH})
 # Only print these messages once, even if dlib is added multiple times via add_subdirectory()
@@ -45,6 +50,18 @@ if(has_parent)
    if (NOT DEFINED DLIB_IN_PROJECT_BUILD)
       set(DLIB_IN_PROJECT_BUILD true)
    endif()
+endif()
+
+if (COMMAND pybind11_add_module AND MSVC)
+   # True when building a python extension module using Visual Studio.  We care
+   # about this because a huge number of windows users have broken systems, and
+   # in particular, they have broken or incompatibly installed copies of things
+   # like libjpeg or libpng.  So if we detect we are in this mode we will never
+   # ever link to those libraries.  Instead, we link to the copy included with
+   # dlib.
+   set (BUILDING_PYTHON_IN_MSVC true)
+else()
+   set (BUILDING_PYTHON_IN_MSVC false)
 endif()
 
 if (DLIB_IN_PROJECT_BUILD)
@@ -150,6 +167,8 @@ if (NOT TARGET dlib)
       "Disable this if you don't want to use NVIDIA CUDA" )
    set (DLIB_USE_MKL_SEQUENTIAL_STR
       "Enable this if you have MKL installed and want to use the sequential version instead of the multi-core version." )
+   set (DLIB_USE_MKL_WITH_TBB_STR
+      "Enable this if you have MKL installed and want to use the tbb version instead of the openmp version." )
    set (DLIB_PNG_SUPPORT_STR
       "Disable this if you don't want to link against libpng" )
    set (DLIB_GIF_SUPPORT_STR
@@ -173,6 +192,7 @@ if (NOT TARGET dlib)
    option(DLIB_ENABLE_STACK_TRACE ${DLIB_ENABLE_STACK_TRACE_STR} OFF)
    toggle_preprocessor_switch(DLIB_ENABLE_STACK_TRACE)
    option(DLIB_USE_MKL_SEQUENTIAL ${DLIB_USE_MKL_SEQUENTIAL_STR} OFF)
+   option(DLIB_USE_MKL_WITH_TBB ${DLIB_USE_MKL_WITH_TBB_STR} OFF)
 
    if(DLIB_ENABLE_ASSERTS)
       # Set these variables so they are set in the config.h.in file when dlib
@@ -410,16 +430,8 @@ if (NOT TARGET dlib)
       endif()
 
       if (DLIB_PNG_SUPPORT)
-         # try to find libpng 
-         find_package(PNG QUIET)
-         # Make sure there isn't something wrong with the version of LIBPNG
-         # installed on this system.  Also never link to anything from anaconda
-         # since it's probably broken.
-         if (PNG_FOUND AND NOT ("${PNG_INCLUDE_DIR}" MATCHES "(.*)(Ana|ana|mini)conda(.*)"))
-            set(CMAKE_REQUIRED_LIBRARIES ${PNG_LIBRARIES})
-            CHECK_FUNCTION_EXISTS(png_create_read_struct LIBPNG_IS_GOOD)
-         endif()
-         if (PNG_FOUND AND LIBPNG_IS_GOOD)
+         include(cmake_utils/find_libpng.cmake)
+         if (PNG_FOUND)
             include_directories(${PNG_INCLUDE_DIR})
             set (dlib_needed_libraries ${dlib_needed_libraries} ${PNG_LIBRARIES})
             set(REQUIRES_LIBS " libpng")
@@ -427,6 +439,8 @@ if (NOT TARGET dlib)
             # If we can't find libpng then statically compile it in.
             include_directories(external/libpng external/zlib)
             set(source_files ${source_files}
+               external/libpng/arm/arm_init.c
+               external/libpng/arm/filter_neon_intrinsics.c
                external/libpng/png.c
                external/libpng/pngerror.c
                external/libpng/pngget.c
@@ -479,16 +493,8 @@ if (NOT TARGET dlib)
       endif()
 
       if (DLIB_JPEG_SUPPORT)
-         # try to find libjpeg 
-         find_package(JPEG QUIET)
-         # Make sure there isn't something wrong with the version of libjpeg 
-         # installed on this system.  Also don't use the installed libjpeg
-         # if this is an APPLE system because apparently it's broken (as of 2015/01/01).
-         if (JPEG_FOUND AND NOT ("${JPEG_INCLUDE_DIR}" MATCHES "(.*)(Ana|ana|mini)conda(.*)"))
-            set(CMAKE_REQUIRED_LIBRARIES ${JPEG_LIBRARY})
-            CHECK_FUNCTION_EXISTS(jpeg_read_header LIBJPEG_IS_GOOD)
-         endif()
-         if (JPEG_FOUND AND LIBJPEG_IS_GOOD AND NOT APPLE)
+         include(cmake_utils/find_libjpeg.cmake)
+         if (JPEG_FOUND)
             include_directories(${JPEG_INCLUDE_DIR})
             set (dlib_needed_libraries ${dlib_needed_libraries} ${JPEG_LIBRARY})
          else()
@@ -549,6 +555,13 @@ if (NOT TARGET dlib)
 
 
       if (DLIB_USE_BLAS OR DLIB_USE_LAPACK OR DLIB_USE_MKL_FFT)
+         if (DLIB_USE_MKL_WITH_TBB AND DLIB_USE_MKL_SEQUENTIAL)
+            set(DLIB_USE_MKL_SEQUENTIAL OFF CACHE STRING ${DLIB_USE_MKL_SEQUENTIAL_STR} FORCE )
+            toggle_preprocessor_switch(DLIB_USE_MKL_SEQUENTIAL)
+            message(STATUS "Disabling DLIB_USE_MKL_SEQUENTIAL. It cannot be used simultaneously with DLIB_USE_MKL_WITH_TBB.")
+         endif()
+
+
          # Try to find BLAS, LAPACK and MKL
          include(cmake_utils/find_blas.cmake)
 
@@ -687,10 +700,22 @@ if (NOT TARGET dlib)
             endif()
 
             # Find where cuSOLVER is since the FindCUDA cmake package doesn't
-            # bother to look for it.
-            get_filename_component(cuda_blas_path "${CUDA_CUBLAS_LIBRARIES}" DIRECTORY)
-            find_library(cusolver cusolver HINTS ${cuda_blas_path})
-            mark_as_advanced(cusolver)
+            # bother to look for it in older versions of cmake.
+            if (NOT CUDA_cusolver_LIBRARY)
+               get_filename_component(cuda_blas_path "${CUDA_CUBLAS_LIBRARIES}" DIRECTORY)
+               find_library(CUDA_cusolver_LIBRARY cusolver HINTS ${cuda_blas_path})
+               # CUDA 10.1 doesn't install symbolic links to libcusolver.so in
+               # the usual place.  This is probably a bug in the cuda
+               # installer.  In any case, If we haven't found cusolver yet go
+               # look in the cuda install folder for it.  New versions of cmake
+               # do this correctly, but older versions need help.
+               if (NOT CUDA_cusolver_LIBRARY)
+                  find_library(CUDA_cusolver_LIBRARY cusolver HINTS 
+                     /usr/local/cuda/lib64/
+                     )
+               endif()
+               mark_as_advanced(CUDA_cusolver_LIBRARY)
+            endif()
             # Also find OpenMP since cuSOLVER needs it.  Importantly, we only
             # look for one to link to if our use of BLAS, specifically the
             # Intel MKL, hasn't already decided what to use.  This is because
@@ -727,7 +752,7 @@ if (NOT TARGET dlib)
                ${CUDA_CUBLAS_LIBRARIES} 
                ${cudnn}
                ${CUDA_curand_LIBRARY}
-               ${cusolver}
+               ${CUDA_cusolver_LIBRARY}
                )
             if(openmp_libraries)
                list(APPEND dlib_needed_libraries ${openmp_libraries})
@@ -740,6 +765,9 @@ if (NOT TARGET dlib)
             toggle_preprocessor_switch(DLIB_USE_CUDA)
             if (USING_OLD_VISUAL_STUDIO_COMPILER)
                message(STATUS "*** Dlib CUDA support requires C++11 but your compiler doesn't support it. ***")
+            endif()
+            if (NOT CUDA_FOUND)
+               message(STATUS "DID NOT FIND CUDA")
             endif()
             message(STATUS "Disabling CUDA support for dlib.  DLIB WILL NOT USE CUDA")
          endif()
